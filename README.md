@@ -95,14 +95,16 @@ Once:
    xcrun notarytool store-credentials barback-notary --apple-id <you> --team-id <TEAMID>
    ```
 3. **The update key**: `scripts/release.sh --make-update-key` makes it, keeps the private half in the keychain and prints the public half. Put that in `scripts/release.conf` as `SPARKLE_PUBLIC_KEY`, and keep a copy of the private half somewhere safe: without it, no update reaches anyone who already has Barback.
-4. **`SITE_URL`** in `scripts/release.conf`: the folder on the website that holds the downloads and `appcast.xml`. Every Barback looks for updates there, so it has to stay put.
+4. **`SITE_URL`** in `scripts/release.conf`: the folder on the website that holds `appcast.xml`. Every Barback looks for updates there, so it has to stay put.
+5. **`GITHUB_REPO`** in `scripts/release.conf`: the public repository whose releases hold the DMGs, with `gh` signed in. Left empty, the DMGs go on the website too.
 
 For each release:
 
 1. Raise `CFBundleShortVersionString` (what people see) and `CFBundleVersion` (what the updater compares; a whole number that goes up) in `Resources/Info.plist`.
 2. Optionally write `release-notes/<version>.md`; the update window shows it.
-3. Run `scripts/release.sh`. It checks the three things above before it builds, and stops with what to do if one is missing.
-4. Upload what it names from `updates/` to `SITE_URL`: the new DMG first, `appcast.xml` last. The moment the feed is up, every Barback offers the update.
+3. Commit and push; the release is tagged at that commit.
+4. Run `scripts/release.sh`. It checks the things above before it builds, and stops with what to do if one is missing. It publishes the GitHub release `v<version>` with the DMG and points the feed at it.
+5. Upload `updates/appcast.xml` to `SITE_URL`. The moment the feed is up, every Barback offers the update.
 
 `updates/` is not in git. Keep it: the feed is built from the DMGs in it.
 

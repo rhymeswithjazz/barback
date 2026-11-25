@@ -18,12 +18,15 @@
 #   dist/Barback.app             the app
 #   dist/Barback-<version>.dmg   the download
 #   updates/                     everything to upload: the DMGs and appcast.xml
+#   a GitHub release v<version>  with the DMG, when GITHUB_REPO is set; then only
+#                                updates/appcast.xml is uploaded
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 source scripts/release.conf
 # For a test run or a build machine: a file holding the private update key, instead of the keychain.
 SPARKLE_KEY_FILE="${SPARKLE_KEY_FILE:-}"
+GITHUB_REPO="${GITHUB_REPO:-}"
 
 say() { printf '\n==> %s\n' "$*"; }
 die() { printf 'release: %s\n' "$*" >&2; exit 1; }
@@ -80,6 +83,14 @@ It asks for an app-specific password, made at https://account.apple.com."
     fi
     if [[ -e updates/$APP_NAME-$VERSION.dmg ]]; then
         die "updates/$APP_NAME-$VERSION.dmg is already there. Raise the version in Resources/Info.plist, or remove that file to release $VERSION again."
+    fi
+    if [[ -n $GITHUB_REPO ]]; then
+        gh auth status >/dev/null 2>&1 || die "gh is not signed in to GitHub (gh auth login), which publishing to $GITHUB_REPO needs."
+        [[ $(gh repo view "$GITHUB_REPO" --json visibility -q .visibility 2>/dev/null) == PUBLIC ]] || die "$GITHUB_REPO is not a public GitHub repository, so Barback could not download its releases."
+        ! gh release view "v$VERSION" --repo "$GITHUB_REPO" >/dev/null 2>&1 || die "$GITHUB_REPO already has a release v$VERSION."
+        [[ -z $(git status --porcelain) ]] || die "commit your changes first: the release is tagged at the current commit."
+        git fetch -q origin
+        [[ $(git rev-parse HEAD) == $(git rev-parse @{u} 2>/dev/null) ]] || die "push the current commit first: the release is tagged at it."
     fi
 fi
 
@@ -187,11 +198,37 @@ KEY=(--account "$SPARKLE_ACCOUNT")
 "$SPARKLE/bin/generate_appcast" "${KEY[@]}" --download-url-prefix "$SITE_URL/" --link "$SITE_URL/" \
     --embed-release-notes --maximum-versions 0 --maximum-deltas 0 -o updates/appcast.xml updates
 
+if [[ -n $GITHUB_REPO ]]; then
+    say "Publishing the GitHub release v$VERSION"
+    git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null || git tag "v$VERSION"
+    git push -q origin "v$VERSION"
+    NOTES=(--notes "")
+    [[ ! -f release-notes/$VERSION.md ]] || NOTES=(--notes-file "release-notes/$VERSION.md")
+    gh release create "v$VERSION" "$DMG" --repo "$GITHUB_REPO" --verify-tag --title "$APP_NAME $VERSION" "${NOTES[@]}"
+fi
+# Every version with its DMG on a GitHub release downloads from there; the rest from SITE_URL.
+# generate_appcast writes SITE_URL into every entry, so this is redone each time.
+if [[ -n $GITHUB_REPO ]]; then
+    for dmg in updates/$APP_NAME-*.dmg; do
+        name=$(basename "$dmg"); v=${name#"$APP_NAME-"}; v=${v%.dmg}
+        gh release view "v$v" --repo "$GITHUB_REPO" --json assets -q '.assets[].name' 2>/dev/null | grep -qxF "$name" || continue
+        sed -i '' "s#url=\"$SITE_URL/$name\"#url=\"https://github.com/$GITHUB_REPO/releases/download/v$v/$name\"#" updates/appcast.xml
+    done
+fi
+
 say "Done: $APP_NAME $VERSION ($BUILD)"
-cat <<NOTE
+if [[ -n $GITHUB_REPO ]]; then
+    cat <<NOTE
+Published https://github.com/$GITHUB_REPO/releases/tag/v$VERSION
+Upload to $SITE_URL/ :
+    updates/appcast.xml   (the moment it is up, every Barback offers the update)
+NOTE
+else
+    cat <<NOTE
 Upload to $SITE_URL/ :
     updates/$APP_NAME-$VERSION.dmg
     updates/appcast.xml   (last: the moment it is up, every Barback offers the update)
 
 Then tag the release:  git tag v$VERSION && git push --tags
 NOTE
+fi

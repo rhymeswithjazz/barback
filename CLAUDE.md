@@ -15,14 +15,14 @@ swift test --filter BarbackCoreTests.AllowListTests         # one test class
 swift test --filter BarbackCoreTests.HotkeyTests/testCarbonFlags   # one test
 swift run                       # runs the app; Ctrl-C quits cleanly and restores hidden items
 scripts/release.sh --adhoc      # dist/Barback.app + DMG, ad hoc signed, for this Mac
-scripts/release.sh              # Developer ID sign, notarize, DMG, Sparkle appcast into updates/
+scripts/release.sh              # Developer ID sign, notarize, DMG, GitHub release, Sparkle appcast into updates/
 swift scripts/make-icon.swift   # Resources/AppIcon.svg -> Resources/AppIcon.icns
 ```
 
 - `swift run` works because `Package.swift` embeds `Resources/Info.plist` into the binary (`-sectcreate __TEXT __info_plist`), giving it a bundle ID and agent (LSUIElement) behaviour. Permissions (Accessibility, the protected files) then belong to the terminal app, not Barback.
 - `log(...)` (in `MenuBarSwitches.swift`) writes `[Barback] …` to stderr in DEBUG builds only.
 - Builds without a feed URL and public key in Info.plist (`swift run`, `--adhoc`) have no updater and make no network connections; `release.sh` injects them from `scripts/release.conf`.
-- Releasing: bump `CFBundleShortVersionString` and `CFBundleVersion` (integer, must increase) in `Resources/Info.plist`; optional notes in `release-notes/<version>.md`. `dist/` and `updates/` are git-ignored; `updates/` must be kept because the appcast is regenerated from the DMGs in it.
+- Releasing: bump `CFBundleShortVersionString` and `CFBundleVersion` (integer, must increase) in `Resources/Info.plist`; optional notes in `release-notes/<version>.md`. `dist/` and `updates/` are git-ignored; `updates/` must be kept because the appcast is regenerated from the DMGs in it. With `GITHUB_REPO` set, the commit must be pushed first; the script tags it, publishes the GitHub release with the DMG and points the appcast's enclosure URLs at the release assets; only `appcast.xml` is uploaded to the site.
 
 ## Architecture
 
