@@ -1,0 +1,1345 @@
+import AppKit
+import BarbackCore
+import ServiceManagement
+
+/// The Barback icon in the menu bar and everything it does.
+///
+/// The code calls the icon "the dot", as Chest (which Barback is forked from) does, though
+/// the user may have chosen any symbol or image for it (`StatusIcon`). Keeping Chest's names
+/// keeps changes from upstream easy to merge.
+///
+/// - ⌘-drag a menu bar item and a drop box hangs under the dot. Drop the item on it and it goes
+///   into the drawer: its app is switched off in System Settings › Menu Bar › Allow in the
+///   Menu Bar. Leave the item anywhere left of the dot and it is hidden there instead.
+/// - Click the dot to open Barback: the items hidden left of it come back, and the drawer
+///   opens under it. Click a drawer item and its menu opens right there, while the item
+///   stays out of the menu bar. Drag a drawer item to the menu bar to put it back.
+/// - Quitting Barback puts every item back in the menu bar; the next launch hides them again.
+@MainActor
+final class BarbackController {
+    /// Asks the app to show the welcome window, which explains the permissions.
+    var onNeedsPermissions: (() -> Void)?
+
+    private let updater = Updater()
+    private let settings = AppSettings.shared
+    private lazy var settingsWindow = SettingsWindowController(updater: updater) { [weak self] in
+        self?.onNeedsPermissions?()
+    }
+    /// The icon the user chose, closed and open.
+    private var icons: StatusIcon.Images
+
+    private enum DotStyle { case dot, open, box }
+
+    /// A ⌘-drag that started in a menu bar.
+    private struct Drag {
+        let id = UUID()
+        /// The dragged item's app, once read; nil while reading or when it is not an app item.
+        var bundleID: String?
+        var isRead = false
+        /// Set when the drag ended before the read finished.
+        var isReleased = false
+        /// Where it ended (Cocoa coordinates), once it has.
+        var releasedAt: CGPoint?
+    }
+
+    /// The menu bar while a drawer item is dragged out: the dot's menu bar and the items in it,
+    /// left to right, in Cocoa coordinates.
+    private struct BarLayout {
+        let bar: CGRect
+        let items: [(bundleID: String, frame: CGRect)]
+    }
+
+    /// An item brought back from the drawer to open, for an app that does not expose its item
+    /// while it is switched off.
+    private struct OpenedItem {
+        let bundleID: String
+        var pid: pid_t?
+        /// It showed a menu or a window since it opened.
+        var sawUI = false
+        /// A click outside asked for it to go back once its menu closes.
+        var isDismissRequested = false
+    }
+
+    private static let spotlight = "com.apple.campo"
+
+    private let store = BarbackStore()
+    private let statusItem: NSStatusItem
+    private let drawer = DrawerPanel(background: AppSettings.shared.drawerBackground)
+    private let dropPanel = DropPanel()
+    private let marker = InsertionMarker()
+    private let notice = NoticePanel()
+    /// Barback is open: the hidden items are in the menu bar and the drawer may be showing.
+    private var isOpen = false
+    private var openMonitors: [Any] = []
+    /// Waits for the menus of hidden items to close before hiding them again.
+    private var hideTimer: Timer?
+    /// Closes an open Barback that is left unused, if the user asked for that.
+    private var idleTimer: Timer?
+    private var idleClock: IdleClock?
+    private var lastIdleCheck: TimeInterval = 0
+    private var dragMonitors: [Any] = []
+    private var drag: Drag?
+    private var barLayout: BarLayout?
+    private var isReadingBarLayout = false
+    private var dotStyle = DotStyle.dot
+    private var lidWork: DispatchWorkItem?
+    private var opened: OpenedItem?
+    private var openedTimer: Timer?
+    private var openedMonitors: [Any] = []
+    private var workspaceObservers: [NSObjectProtocol] = []
+    private var fileAccessObserver: NSObjectProtocol?
+    private var lastAgentRestart: Date?
+    private let layoutObserver = MenuBarLayoutObserver()
+    /// Waits for a burst of layout changes (one per menu bar window) to end.
+    private var dotCheckWork: DispatchWorkItem?
+    private var glyphWork: DispatchWorkItem?
+    /// The dot is switched off for a moment while it moves.
+    private var isMovingDot = false
+    /// Moves tried for the items in `dotMovesFor`; after two Barback stops trying until other
+    /// items are left of the dot, or MenuBarAgent starts again.
+    private var dotMoves = 0
+    private var dotMovesFor: Set<String> = []
+    /// Drops left to settle; a dropped item may be left of the dot until it is hidden.
+    private var settling = 0
+    private var dotMoveBudget = MoveBudget()
+    /// Apps Barback hides whose allow-list entry went away (see `relist`). An entry MenuBarAgent
+    /// makes for one again is allowed by default, which is not the user switching it on.
+    private var lostEntries: Set<String> = []
+    private let ownBundleID = Bundle.main.bundleIdentifier
+    private static let dotAutosaveName = "com.rhymeswithjazz.barback.dot"
+    /// The dot's key among MenuBarAgent's positions. It names an app by its bundle identifier,
+    /// and a program outside a bundle (`swift run`) by its process name.
+    private var dotPositionKey: String {
+        let owner = Bundle.main.bundleURL.pathExtension == "app" ? ownBundleID : nil
+        return "status:\(owner ?? ProcessInfo.processInfo.processName)::\(Self.dotAutosaveName)"
+    }
+
+    init() {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        icons = StatusIcon.images(for: AppSettings.shared.icon)
+        // Keeps the dot where the user ⌘-dragged it, across launches.
+        statusItem.autosaveName = Self.dotAutosaveName
+        if let button = statusItem.button {
+            button.target = self
+            button.action = #selector(dotClicked)
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+            button.setAccessibilityLabel("Barback")
+        }
+        applyIcon()
+
+        settings.onIconChange = { [weak self] in self?.applyIcon() }
+        settings.onHotkeyChange = { [weak self] in
+            guard let self else { return }
+            HotkeyCenter.shared.set(self.settings.hotkey)
+        }
+        settings.onDrawerBackgroundChange = { [weak self] in
+            guard let self else { return }
+            self.drawer.setBackground(self.settings.drawerBackground)
+        }
+        settings.onDrawerIconStyleChange = { [weak self] in
+            guard let self else { return }
+            self.captureGlyphs()
+            self.refreshDrawer()
+        }
+        MenuBarGlyphs.onChange = { [weak self] in self?.refreshDrawer() }
+        settings.onAutoCloseChange = { [weak self] in
+            guard let self, self.isOpen else { return }
+            self.startIdleTimer()
+        }
+        HotkeyCenter.shared.onPress = { [weak self] in self?.toggle() }
+        HotkeyCenter.shared.set(settings.hotkey)
+
+        drawer.onOpen = { [weak self] bundleID in self?.open(bundleID) }
+        drawer.onRemove = { [weak self] bundleID in self?.remove(bundleID) }
+        drawer.onDragMove = { [weak self] bundleID, point in self?.dragOutMoved(bundleID, to: point) ?? false }
+        drawer.onDragEnd = { [weak self] bundleID, point in self?.dragOutEnded(bundleID, at: point) }
+        store.onChange = { [weak self] in self?.refreshDrawer() }
+
+        installDragMonitors()
+        observeWorkspace()
+        // A file picked during setup works at once: the items go away now.
+        fileAccessObserver = NotificationCenter.default.addObserver(forName: .protectedFileGranted, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.hideStoredItems()
+                self?.scheduleDotCheck()
+            }
+        }
+        // Quitting in the middle of moving the dot would leave it switched off.
+        if let ownBundleID { MenuBarSwitches.set(true, for: [ownBundleID]) }
+        hideStoredItems()
+        layoutObserver.onChange = { [weak self] in
+            self?.scheduleDotCheck()
+            self?.captureGlyphs(after: 1.5)
+        }
+        layoutObserver.onAgentLaunch = { [weak self] in
+            guard let self else { return }
+            self.dotMoves = 0
+            self.dotMovesFor = []
+            // It lays out the menu bar as it starts, maybe before the observer was there.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.scheduleDotCheck() }
+        }
+        scheduleDotCheck()
+        captureGlyphs(after: 2)
+    }
+
+    /// Puts every item back in the menu bar. Called when Barback quits.
+    func restoreAll() {
+        endOpened(rehide: false)
+        MenuBarSwitches.set(true, for: isMovingDot ? store.all.union([ownBundleID].compactMap { $0 }) : store.all)
+    }
+
+    // MARK: - The dot
+
+    @objc private func dotClicked() {
+        let event = NSApp.currentEvent
+        if event?.type == .rightMouseUp || event?.modifierFlags.contains(.control) == true {
+            showMenu()
+            return
+        }
+        toggle()
+    }
+
+    func showSettings() {
+        settingsWindow.show()
+    }
+
+    /// Opens Barback, or closes it: a click on the dot, and the shortcut.
+    private func toggle() {
+        if isOpen {
+            closeBarback()
+            return
+        }
+        guard Permissions.allGranted else {
+            onNeedsPermissions?()
+            return
+        }
+        openBarback()
+    }
+
+    /// Draws the icon the user chose, now and after a change in Settings.
+    private func applyIcon() {
+        icons = StatusIcon.images(for: settings.icon, revision: settings.imageRevision)
+        // A square holds the dot and most symbols; a wide symbol or image gets its width.
+        statusItem.length = icons.width > 22 ? ceil(icons.width) + 12 : NSStatusItem.squareLength
+        applyDotStyle(dotStyle)
+    }
+
+    private func applyDotStyle(_ style: DotStyle) {
+        dotStyle = style
+        guard let button = statusItem.button else { return }
+        let image: NSImage?
+        switch style {
+        case .dot:
+            image = icons.closed
+        case .open:
+            // The icon's open form while Barback is open: the dot as a ring, a chevron turned
+            // round, another icon dimmed. macOS 27 draws status items in MenuBarAgent, which
+            // ignores the button's highlight.
+            image = icons.open
+        case .box:
+            // A box to drop into.
+            image = NSImage(systemSymbolName: "archivebox.fill", accessibilityDescription: "Drop into Barback")?
+                .withSymbolConfiguration(.init(pointSize: 13, weight: .regular))
+            image?.isTemplate = true
+        }
+        button.image = image
+        button.toolTip = store.all.isEmpty
+            ? "Barback: ⌘-drag a menu bar item left of this icon to hide it, or onto the box that appears to keep it in the drawer"
+            : "Barback: click to open" + (settings.hotkey.map { " (\($0.displayName))" } ?? "")
+    }
+
+    /// The dot's look when nothing is being dragged.
+    private var restingStyle: DotStyle { isOpen ? .open : .dot }
+
+    /// The box closes over a new item: shows the box for a moment, then the dot again.
+    private func closeLid() {
+        lidWork?.cancel()
+        applyDotStyle(.box)
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.drag == nil else { return }
+            self.applyDotStyle(self.restingStyle)
+        }
+        lidWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: work)
+    }
+
+    /// The dot's frame (Cocoa coordinates) and screen.
+    private var dot: (frame: CGRect, screen: NSScreen)? {
+        guard let window = statusItem.button?.window, let screen = window.screen ?? NSScreen.main else { return nil }
+        return (window.frame, screen)
+    }
+
+    /// The menu bar the dot is in.
+    private var dotMenuBar: CGRect? {
+        guard let dot else { return nil }
+        return Screens.menuBars.first { $0.intersects(dot.frame) }
+    }
+
+    /// The lines under the version in About Barback. The license line is here rather than in
+    /// `NSHumanReadableCopyright`, which About shows as plain text, so it can link.
+    private static var aboutCredits: NSAttributedString {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
+            .foregroundColor: NSColor.secondaryLabelColor,
+            .paragraphStyle: paragraph,
+        ]
+        let credits = NSMutableAttributedString(string: "Open source under the MIT License\n", attributes: attributes)
+        var link = attributes
+        link[.link] = URL(string: "https://github.com/rhymeswithjazz/barback")!
+        credits.append(NSAttributedString(string: "https://github.com/rhymeswithjazz/barback\n", attributes: link))
+        let spaced = NSMutableParagraphStyle()
+        spaced.alignment = .center
+        spaced.paragraphSpacingBefore = 6
+        var origin = attributes
+        origin[.paragraphStyle] = spaced
+        // Chest's license asks that its copyright notice stays with copies of it.
+        credits.append(NSAttributedString(string: "Based on Chest, © 2026 BORINGBAR, LLC\n", attributes: origin))
+        link[.link] = URL(string: "https://github.com/boringbar/chest")!
+        credits.append(NSAttributedString(string: "https://github.com/boringbar/chest", attributes: link))
+        return credits
+    }
+
+    private func showMenu() {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        menu.addItem(ClosureMenuItem(title: isOpen ? "Close Barback" : "Open Barback") { [weak self] in
+            self?.dotClicked()
+        })
+        menu.addItem(.separator())
+        menu.addItem(ClosureMenuItem(title: "Settings…", keyEquivalent: ",") { [weak self] in self?.showSettings() })
+        menu.addItem(ClosureMenuItem(title: "Permissions") { [weak self] in self?.onNeedsPermissions?() })
+        if Bundle.main.bundleURL.pathExtension == "app" {
+            let login = ClosureMenuItem(title: "Open at Login") {
+                let service = SMAppService.mainApp
+                try? service.status == .enabled ? service.unregister() : service.register()
+            }
+            login.state = SMAppService.mainApp.status == .enabled ? .on : .off
+            menu.addItem(login)
+        }
+        if updater.isAvailable {
+            let check = ClosureMenuItem(title: "Check for Updates") { [weak self] in self?.updater.checkForUpdates() }
+            check.isEnabled = updater.canCheckForUpdates
+            menu.addItem(check)
+        }
+        menu.addItem(ClosureMenuItem(title: "About Barback") {
+            NSApp.activate()
+            NSApp.orderFrontStandardAboutPanel(options: [.credits: Self.aboutCredits])
+        })
+        menu.addItem(.separator())
+        menu.addItem(ClosureMenuItem(title: "Quit Barback", keyEquivalent: "q") { NSApp.terminate(nil) })
+        closeDrawer()
+        statusItem.menu = menu
+        statusItem.button?.performClick(nil)
+        // A lasting menu would take every left click as well.
+        statusItem.menu = nil
+    }
+
+    // MARK: - Putting items in and taking them out
+
+    private func hideStoredItems() {
+        // While Barback is open the hidden items stay out.
+        let items = isOpen ? Set(store.items) : store.all
+        guard !items.isEmpty else { return }
+        if switchOff(items) == .noAccess {
+            onNeedsPermissions?()
+        }
+    }
+
+    /// Puts an app's items in the drawer or hides them left of the dot. Hidden items stay in
+    /// the menu bar while Barback is open, as the others there do.
+    private func put(_ bundleID: String, in section: Section) {
+        let name = AppInfo(bundleID: bundleID).name
+        let result: MenuBarSwitches.Result
+        if section == .drawer || !isOpen {
+            result = switchOff([bundleID])
+        } else if MenuBarSwitches.isListed(bundleID) {
+            result = .done
+        } else {
+            result = MenuBarSwitches.hasAccess ? .untracked([bundleID]) : .noAccess
+        }
+        switch result {
+        case .done:
+            store.add(bundleID, to: section)
+            if section == .drawer || !isOpen { closeLid() }
+        case .untracked:
+            applyDotStyle(restingStyle)
+            showNotice("Barback can’t hide \(name) yet",
+                       detail: "macOS hasn’t listed \(name) under System Settings › Menu Bar › Allow in the Menu Bar, so its item can’t be switched off. This happens most with apps outside the Applications folder. Refreshing the menu bar makes macOS list every app with an item; the menu bar blinks once.",
+                       action: ("Refresh Menu Bar", { [weak self] in self?.refreshMenuBar(thenPut: bundleID, in: section) }))
+        case .noAccess:
+            applyDotStyle(restingStyle)
+            showNotice("Barback can’t reach “Allow in the Menu Bar”",
+                       detail: "It hides items through macOS’s own “Allow in the Menu Bar” switches. Choose the file that holds them, and Barback can use that one file.",
+                       action: ("Choose File…", { FileAccess.choose(.allowList) }))
+        }
+    }
+
+    /// Switches items off, then checks that they left the menu bar. MenuBarAgent can stop
+    /// noticing changes to the list while it runs, leaving every item where it is (seen once,
+    /// with about 70 apps; the trigger is not known). Restarting it makes it read the list
+    /// again, as Refresh Menu Bar does.
+    @discardableResult
+    private func switchOff(_ bundleIDs: Set<String>) -> MenuBarSwitches.Result {
+        let result = MenuBarSwitches.set(false, for: bundleIDs)
+        if result == .done { confirmGone(bundleIDs) }
+        return result
+    }
+
+    private func confirmGone(_ bundleIDs: Set<String>) {
+        Task { [weak self] in
+            // MenuBarAgent takes well under a second to apply a change.
+            try? await Task.sleep(for: .seconds(1.5))
+            let shown = await Task.detached { MenuBarItems.shownBundleIDs() }.value
+            guard let self else { return }
+            // Only those that should still be away: Barback may have opened meanwhile.
+            let stuck = bundleIDs.intersection(shown).filter(self.shouldBeHidden)
+            guard !stuck.isEmpty else { return }
+            // A restart that did not help would not help again right away.
+            if let last = self.lastAgentRestart, Date().timeIntervalSince(last) < 30 {
+                log("MenuBarAgent still shows \(stuck.sorted()) after a restart")
+                return
+            }
+            log("MenuBarAgent kept \(stuck.sorted()) after switching them off; restarting it")
+            self.restartMenuBarAgent()
+        }
+    }
+
+    /// Whether an app's items should be out of the menu bar right now.
+    private func shouldBeHidden(_ bundleID: String) -> Bool {
+        switch store.section(of: bundleID) {
+        case .drawer: opened?.bundleID != bundleID
+        case .hidden: !isOpen
+        case nil: false
+        }
+    }
+
+    /// Restarts MenuBarAgent, which reads the list and lists every running app with an item
+    /// as it starts. launchd starts it again at once; the menu bar blinks once.
+    private func restartMenuBarAgent() {
+        guard let agent = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.MenuBarAgent").first else { return }
+        lastAgentRestart = Date()
+        kill(agent.processIdentifier, SIGTERM)
+    }
+
+    /// Gets the allow-list entries of `bundleIDs` back and switches them off again: restarting
+    /// MenuBarAgent lists every running app with an item, as Refresh Menu Bar does. The menu
+    /// bar blinks once. At most every 30 seconds, shared with `confirmGone`.
+    private func relist(_ bundleIDs: Set<String>) {
+        lostEntries.formUnion(bundleIDs)
+        if let last = lastAgentRestart, Date().timeIntervalSince(last) < 30 {
+            // A check after the wait tries again.
+            let wait = 30 - Date().timeIntervalSince(last) + 1
+            DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in self?.scheduleDotCheck() }
+            return
+        }
+        log("\(bundleIDs.sorted()) lost their allow-list entries; restarting MenuBarAgent to list them again")
+        restartMenuBarAgent()
+        Task { [weak self] in
+            for _ in 0..<20 {
+                try? await Task.sleep(for: .milliseconds(300))
+                if bundleIDs.allSatisfy(MenuBarSwitches.isListed) { break }
+            }
+            guard let self else { return }
+            let away = bundleIDs.filter(self.shouldBeHidden)
+            if !away.isEmpty, self.switchOff(away) == .done { self.lostEntries.subtract(away) }
+        }
+    }
+
+    /// Restarts MenuBarAgent so it lists `bundleID`, then tries it again.
+    private func refreshMenuBar(thenPut bundleID: String, in section: Section) {
+        log("restarting MenuBarAgent to list \(bundleID)")
+        restartMenuBarAgent()
+        Task { [weak self] in
+            for _ in 0..<20 {
+                try? await Task.sleep(for: .milliseconds(300))
+                if MenuBarSwitches.isListed(bundleID) { break }
+            }
+            self?.put(bundleID, in: section)
+        }
+    }
+
+    private func remove(_ bundleID: String) {
+        if opened?.bundleID == bundleID { endOpened(rehide: false) }
+        store.remove(bundleID)
+        // It stays in the menu bar for good: right of the dot, not among the hidden items.
+        placeRightOfDot(bundleID)
+        MenuBarSwitches.set(true, for: [bundleID])
+    }
+
+    // MARK: - Keeping the dot left of the items
+
+    /// A new app's item shows up at the left end of the menu bar, left of the dot, where only
+    /// the items Barback hides belong. Whenever MenuBarAgent lays out the menu bar again, Barback
+    /// looks for one and puts the dot back past it.
+    private func scheduleDotCheck() {
+        dotCheckWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.checkDotPlace() }
+        dotCheckWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+    }
+
+    /// Whether items may be left of the dot right now: Barback is open or closing, an item
+    /// is dragged, settling or opened, or the dot itself is on the move.
+    private var isDotPlaceBusy: Bool {
+        isOpen || hideTimer != nil || drag != nil || settling > 0 || barLayout != nil || opened != nil || isMovingDot
+    }
+
+    /// A check that finds Barback busy waits for it to be free instead of being dropped: what
+    /// appeared meanwhile posts no layout change once Barback has closed or a drag ended.
+    private func retryDotCheck() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.scheduleDotCheck() }
+    }
+
+    private func checkDotPlace() {
+        guard !isDotPlaceBusy else { return retryDotCheck() }
+        guard Permissions.allGranted, let dot, let bar = dotMenuBar else { return }
+        let dotFrame = Screens.flipped(dot.frame)
+        let point = Screens.flipped(CGRect(x: bar.midX, y: bar.midY, width: 0, height: 0)).origin
+        let own = ownBundleID
+        Task { [weak self] in
+            let items = await Task.detached { MenuBarItems.items(inMenuBarContaining: point) }.value
+            guard let self else { return }
+            guard !self.isDotPlaceBusy else { return self.retryDotCheck() }
+            // An item Barback hides that is drawn anyway:
+            // - With its own switch on, it was switched back on outside Barback (System Settings
+            //   shows Barback's hiding as the switch being off). It is the user's again; putting
+            //   back what Barback kept would undo what they choose next.
+            // - With no entry in the allow list, macOS dropped it: System Settings' Menu Bar
+            //   pane removes the entries of apps it can't find in a permanent place (a
+            //   temporary folder) as it opens, and MenuBarAgent then draws them. MenuBarAgent
+            //   lists them again when it starts.
+            // - With its switch on but its entry lost before, that entry is MenuBarAgent's new
+            //   one, allowed by default: it is switched off again.
+            // - With its switch off, a login item (Weather's) was started again at login: it
+            //   is switched off again.
+            var lost: Set<String> = []
+            for bundleID in Set(items.map(\.bundleID)) where self.shouldBeHidden(bundleID) {
+                switch MenuBarSwitches.isOn(bundleID) {
+                case true? where self.lostEntries.contains(bundleID):
+                    log("\(bundleID) is listed again; switching it off")
+                    if self.switchOff([bundleID]) == .done { self.lostEntries.remove(bundleID) }
+                case true?:
+                    log("\(bundleID) was switched back on outside Barback; letting it go")
+                    self.store.remove(bundleID)
+                    MenuBarSwitches.forget(bundleID)
+                case false? where MenuBarSwitches.isLoginItem(bundleID):
+                    log("\(bundleID) was started again; switching it off")
+                    self.switchOff([bundleID])
+                case nil where MenuBarSwitches.hasAccess && !MenuBarSwitches.isSystemItem(bundleID):
+                    lost.insert(bundleID)
+                default:
+                    break
+                }
+            }
+            if !lost.isEmpty { self.relist(lost) }
+            // Items Barback hides can still be drawn for a moment after they are switched off,
+            // where the next one slides in. The store is read now: a drop may have hidden one
+            // during the read.
+            let stored = self.store.all
+            let shown = items.filter { !stored.contains($0.bundleID) }
+            // When the items don't fit, macOS collapses the leftmost, the dot among them, behind
+            // its « button. Their frames then repeat and overlap (seen on macOS 27.0.1): the
+            // dot shows twice or not at all. Nothing read then says what is left of the dot.
+            // A build run from the terminal is not in the list, so this skips it too; it can't
+            // move its dot anyway, as its switch belongs to the installed Barback.
+            // With the screens asleep or locked nothing is listed; a check follows when they
+            // wake or unlock.
+            guard !shown.isEmpty else {
+                log("menu bar unreadable; checking the dot once the screens wake")
+                return
+            }
+            let overlaps = zip(shown, shown.dropFirst()).contains { $0.frame.maxX > $1.frame.minX + 1 }
+            guard shown.filter({ $0.bundleID == own }).count == 1, !overlaps else {
+                log("menu bar overflowing; leaving the dot where it is")
+                return
+            }
+            let left = shown.filter { $0.frame.midX < dotFrame.minX && $0.bundleID != own }
+            let ids = Set(left.map(\.bundleID))
+            if ids != self.dotMovesFor {
+                self.dotMovesFor = ids
+                self.dotMoves = 0
+            }
+            guard !left.isEmpty, self.dotMoves < 2 else { return }
+            let now = Date()
+            guard left.contains(where: { self.dotMoveBudget.allows($0.bundleID, at: now) }) else {
+                log("\(ids.sorted()) keep coming back left of the dot; leaving the dot for now")
+                return
+            }
+            self.dotMoveBudget.record(ids, at: now)
+            self.dotMoves += 1
+            log("\(left.map(\.bundleID)) left of the dot; placing the dot again (try \(self.dotMoves))")
+            self.placeDot(past: left, barMaxX: bar.maxX)
+        }
+    }
+
+    /// Puts the dot back left of `items` by switching Barback off and on: MenuBarAgent places an
+    /// item that is switched back on at its position, so the dot's is moved past theirs first.
+    /// Past every position but the hidden items', in fact: only those belong left of the dot,
+    /// and some items left of it can't be matched to a key (a system item Barback has no switch
+    /// for). A new item has none saved, often not even once the dot has gone (seen on macOS
+    /// 27.0.1); MenuBarAgent places it as if it had the one where it is drawn, which is
+    /// estimated from its frame. The hidden items stay further left. The dot blinks once.
+    private func placeDot(past items: [MenuBarItems.Item], barMaxX: CGFloat) {
+        guard let own = ownBundleID else { return }
+        let positions = MenuBarPositions.all()
+        // An app signed ad hoc or run outside a bundle is named by its process name.
+        let hidden = Set(store.hidden).union(store.hidden.compactMap {
+            NSRunningApplication.runningApplications(withBundleIdentifier: $0).first?.executableURL?.lastPathComponent
+        })
+        let past = positions.keys.filter { key in
+            key != dotPositionKey && !(PreferredPositions.bundleID(ofKey: key).map(hidden.contains) ?? false)
+        }
+        let estimates = items.map { PreferredPositions.estimate(itemMinX: $0.frame.minX, barMaxX: barMaxX) }
+        let placement = PreferredPositions.dotPlacement(dotKey: dotPositionKey, past: past, estimates: estimates, hidden: hidden, in: positions)
+        var changes = placement.moved
+        if let dot = placement.dot, dot != positions[dotPositionKey] { changes[dotPositionKey] = dot }
+        isMovingDot = true
+        if !changes.isEmpty { MenuBarPositions.set(changes) }
+        // MenuBarAgent saves the positions it holds as the dot goes; give it time to read the
+        // new ones first, or it writes the old one back (0.5 s, as measured).
+        DispatchQueue.main.asyncAfter(deadline: .now() + (changes.isEmpty ? 0 : 0.5)) { [weak self] in
+            self?.switchDotOffAndOn(own)
+        }
+    }
+
+    private func switchDotOffAndOn(_ own: String) {
+        guard MenuBarSwitches.set(false, for: [own]) == .done else {
+            isMovingDot = false
+            return
+        }
+        // Off long enough for MenuBarAgent to take the dot away (1.5 s, as measured).
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            Task { [weak self] in
+                let shown = await Task.detached { MenuBarItems.shownBundleIDs() }.value
+                guard let self else {
+                    MenuBarSwitches.set(true, for: [own])
+                    return
+                }
+                MenuBarSwitches.set(true, for: [own])
+                self.isMovingDot = false
+                // MenuBarAgent can stop noticing changes to the list (see `switchOff`), and the
+                // dot stays where it is. Restarting it makes it read the list and the positions
+                // again, which places the dot as switching it back on would. It is switched on
+                // first, so MenuBarAgent starts with it on; that try does not count.
+                if shown.contains(own), self.lastAgentRestart.map({ Date().timeIntervalSince($0) >= 30 }) ?? true {
+                    log("MenuBarAgent kept the dot after switching it off; restarting it")
+                    self.dotMoves -= 1
+                    self.restartMenuBarAgent()
+                    return
+                }
+                // MenuBarAgent posts no layout change when the dot comes back; check once it
+                // is, in case an item is still left of it.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.scheduleDotCheck() }
+            }
+        }
+    }
+
+    // MARK: - ⌘-dragging menu bar items
+
+    private func installDragMonitors() {
+        let handler: (NSEvent) -> Void = { [weak self] event in
+            let type = event.type
+            let flags = event.modifierFlags
+            let location = NSEvent.mouseLocation
+            MainActor.assumeIsolated { self?.handleDrag(type, flags: flags, at: location) }
+        }
+        if let monitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp], handler: handler) {
+            dragMonitors.append(monitor)
+        }
+    }
+
+    private func handleDrag(_ type: NSEvent.EventType, flags: NSEvent.ModifierFlags, at location: CGPoint) {
+        switch type {
+        case .leftMouseDown:
+            drag = nil
+            guard flags.contains(.command), Screens.menuBars.contains(where: { $0.contains(location) }) else { return }
+            let current = Drag()
+            drag = current
+            readDraggedItem(at: location, dragID: current.id)
+        case .leftMouseDragged:
+            guard let drag, drag.bundleID != nil, let dot else { return }
+            if !dropPanel.isVisible {
+                // The drawer would be in the way of the drop box.
+                closeDrawer()
+                dropPanel.show(under: dot.frame, on: dot.screen)
+            }
+            dropPanel.isTargeted = dropPanel.frame.contains(location)
+            let style: DotStyle = dropPanel.isTargeted ? .box : restingStyle
+            if style != dotStyle { applyDotStyle(style) }
+        case .leftMouseUp:
+            guard var current = drag else { return }
+            let onDropTarget = dropPanel.isVisible && dropPanel.frame.contains(location)
+            dropPanel.dismiss()
+            if !current.isRead {
+                // The item is not known yet; settle it once the read lands. The drop box showed
+                // only once it was known, so it was not dropped there.
+                current.isReleased = true
+                current.releasedAt = location
+                drag = current
+                return
+            }
+            drag = nil
+            finishDrop(of: current.bundleID, onDropTarget: onDropTarget, at: location)
+        default:
+            break
+        }
+    }
+
+    private func readDraggedItem(at location: CGPoint, dragID: UUID) {
+        let point = Screens.flipped(CGRect(origin: location, size: .zero)).origin
+        let own = ownBundleID
+        let away = Set(store.all.filter(shouldBeHidden))
+        Task.detached(priority: .userInitiated) {
+            let hit = MenuBarItems.items(inMenuBarContaining: point)
+                .first { $0.frame.minX <= point.x && point.x < $0.frame.maxX }
+            // The dot, and MenuBarAgent's items without a switch (the clock, a control from the
+            // Control Gallery, …), are not Barback's to take: the dot is put back once they land.
+            var bundleID = hit.flatMap { $0.bundleID == own || !$0.canHide ? nil : $0.bundleID }
+            // An item that was just switched off can still be listed where the next one slides
+            // in. The drag's own window shows which item it really is, once it is up.
+            if let read = bundleID, away.contains(read) {
+                for _ in 0..<10 {
+                    try? await Task.sleep(for: .milliseconds(60))
+                    if let dragged = MenuBarItems.draggedItem() {
+                        bundleID = dragged.bundleID == own || !dragged.canHide ? nil : dragged.bundleID
+                        break
+                    }
+                }
+                log("\(read) was already away; the drag is on \(bundleID ?? "nothing")")
+            }
+            await MainActor.run { [weak self] in
+                guard let self, var current = self.drag, current.id == dragID else { return }
+                current.bundleID = bundleID
+                current.isRead = true
+                log("drag started on \(bundleID ?? "nothing")")
+                if current.isReleased {
+                    self.drag = nil
+                    self.finishDrop(of: bundleID, onDropTarget: false, at: current.releasedAt)
+                } else {
+                    self.drag = current
+                }
+            }
+        }
+    }
+
+    /// Dropped on the drop box, the item goes into the drawer. Anywhere else MenuBarAgent puts it
+    /// in the menu bar where it was let go: left of the dot it is hidden, right of it shown.
+    private func finishDrop(of bundleID: String?, onDropTarget: Bool, at location: CGPoint?) {
+        if dotStyle != restingStyle { applyDotStyle(restingStyle) }
+        guard let bundleID else {
+            // The dot itself, or an item Barback can't take, was dragged; only an item dragged
+            // left of the dot is hidden there. Whatever is left of the dot now, the dot goes
+            // back past it.
+            scheduleDotCheck()
+            return
+        }
+        if onDropTarget {
+            log("dropped \(bundleID) into the drawer")
+            // Let MenuBarAgent finish settling the drop before the item disappears.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in self?.put(bundleID, in: .drawer) }
+            return
+        }
+        // MenuBarAgent moves the item into place over a few frames.
+        settling += 1
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in self?.settle(bundleID, droppedAt: location) }
+    }
+
+    /// Hides an item left where it was let go left of the dot, and shows a hidden one moved
+    /// right of it.
+    private func settle(_ bundleID: String, droppedAt location: CGPoint?) {
+        // The dot was left alone while the drop settled; a check may have been skipped.
+        let done = { [weak self] in
+            guard let self else { return }
+            self.settling -= 1
+            self.scheduleDotCheck()
+        }
+        // Every display has a menu bar with every item, the dot too. The item is compared with
+        // the dot in the one it was dropped in; the dot's own window is on just one of them.
+        let bars = Screens.menuBars
+        guard store.section(of: bundleID) != .drawer,
+              let bar = location.flatMap({ point in bars.first { $0.minX <= point.x && point.x < $0.maxX } }) ?? dotMenuBar else { return done() }
+        let point = Screens.flipped(CGRect(x: bar.midX, y: bar.midY, width: 0, height: 0)).origin
+        let own = ownBundleID
+        // A build run from the terminal is not in the list; its window stands in, if it is there.
+        let window = dot.flatMap { bar.intersects($0.frame) ? $0.frame : nil }
+        Task { [weak self] in
+            defer { done() }
+            let items = await Task.detached { MenuBarItems.items(inMenuBarContaining: point) }.value
+            guard let self else { return }
+            let x = location?.x ?? bar.midX
+            guard let found = items.filter({ $0.bundleID == bundleID }).min(by: { abs($0.frame.midX - x) < abs($1.frame.midX - x) }),
+                  let dotX = items.first(where: { $0.bundleID == own })?.frame.midX ?? window?.midX else { return }
+            if found.frame.midX < dotX {
+                guard self.store.section(of: bundleID) != .hidden else { return }
+                log("\(bundleID) left of the dot: hiding it")
+                self.put(bundleID, in: .hidden)
+            } else if self.store.section(of: bundleID) == .hidden {
+                log("\(bundleID) right of the dot: showing it")
+                self.store.remove(bundleID)
+            }
+        }
+    }
+
+    // MARK: - Dragging items out of the drawer
+
+    /// Shows where a drawer item dragged to `point` would go. Returns whether it can be
+    /// dropped there: anywhere in the dot's menu bar.
+    private func dragOutMoved(_ bundleID: String, to point: CGPoint) -> Bool {
+        if barLayout == nil {
+            readBarLayout(without: bundleID)
+            return false
+        }
+        guard let target = dropTarget(at: point) else {
+            marker.dismiss()
+            return false
+        }
+        marker.show(at: target.x, in: target.bar)
+        return true
+    }
+
+    private func dragOutEnded(_ bundleID: String, at point: CGPoint) {
+        marker.dismiss()
+        defer { barLayout = nil }
+        guard let target = dropTarget(at: point), let layout = barLayout else { return }
+        // Its place among the others, between the positions MenuBarAgent keeps for them.
+        // Items it keeps no position for (its own modules) are skipped.
+        let positions = MenuBarPositions.all()
+        let own = ownBundleID ?? ""
+        let known = layout.items.map {
+            $0.bundleID == own ? positions[dotPositionKey] : PreferredPositions.position(of: $0.bundleID, in: positions)
+        }
+        let left = known[..<target.index].last { $0 != nil } ?? nil
+        let right = known[target.index...].first { $0 != nil } ?? nil
+        if let position = PreferredPositions.between(left, and: right) {
+            MenuBarPositions.set(position, for: bundleID)
+        }
+        log("dragged \(bundleID) out of the drawer, \(target.isLeftOfDot ? "left" : "right") of the dot")
+        if target.isLeftOfDot {
+            store.add(bundleID, to: .hidden)
+            if isOpen { MenuBarSwitches.set(true, for: [bundleID]) }
+        } else {
+            store.remove(bundleID)
+            MenuBarSwitches.set(true, for: [bundleID])
+        }
+    }
+
+    /// Reads the items in the dot's menu bar, once per drag out.
+    private func readBarLayout(without bundleID: String) {
+        guard !isReadingBarLayout, let dot, let bar = dotMenuBar else { return }
+        isReadingBarLayout = true
+        let point = Screens.flipped(CGRect(x: bar.midX, y: bar.midY, width: 0, height: 0)).origin
+        let own = ownBundleID ?? ""
+        Task { [weak self] in
+            let items = await Task.detached { MenuBarItems.items(inMenuBarContaining: point) }.value
+            guard let self else { return }
+            self.isReadingBarLayout = false
+            var layout = items
+                .filter { $0.bundleID != bundleID && $0.bundleID != own }
+                .map { (bundleID: $0.bundleID, frame: Screens.flipped($0.frame)) }
+            // A build run from the terminal has no bundle in the window list; add the dot itself.
+            layout.append((bundleID: own, frame: dot.frame))
+            self.barLayout = BarLayout(bar: bar, items: layout.sorted { $0.frame.minX < $1.frame.minX })
+        }
+    }
+
+    /// Where a drawer item let go at `point` goes: at `x`, before the item at `index`.
+    private func dropTarget(at point: CGPoint) -> (x: CGFloat, bar: CGRect, index: Int, isLeftOfDot: Bool)? {
+        guard let layout = barLayout,
+              point.y >= layout.bar.minY - 6, point.y <= layout.bar.maxY + 1,
+              point.x >= layout.bar.minX, point.x <= layout.bar.maxX else { return nil }
+        let frames = layout.items.map(\.frame)
+        let index = MenuBarGeometry.insertionIndex(at: point.x, among: frames)
+        let x = index < frames.count ? frames[index].minX : (frames.last?.maxX ?? point.x)
+        let dotIndex = layout.items.firstIndex { $0.bundleID == (ownBundleID ?? "") } ?? frames.count
+        return (x, layout.bar, index, index <= dotIndex)
+    }
+
+    // MARK: - Opening and closing Barback
+
+    private var drawerItems: [AppInfo] {
+        // An app that is not running has no item to show.
+        let glyphs = settings.drawerIconStyle == .singleColor
+        return store.items.map { bundleID in
+            var info = AppInfo(bundleID: bundleID)
+            if glyphs, let glyph = MenuBarGlyphs.glyph(for: bundleID) { info.icon = glyph }
+            return info
+        }.filter(\.isRunning)
+    }
+
+    /// With single-colour drawer icons, captures the glyph of every item in the menu bar, so an
+    /// item has one once it is put in the drawer. Waits for a burst of layout changes to end,
+    /// and skips a drag: the dragged item is drawn on its own then.
+    private func captureGlyphs(after delay: TimeInterval = 0) {
+        glyphWork?.cancel()
+        guard settings.drawerIconStyle == .singleColor else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.drag == nil, !self.isMovingDot else { return }
+            // Items Barback switches off are seen only while being switched on or off, when
+            // MenuBarAgent can draw a placeholder in their place: drawer items never, hidden
+            // ones only while Barback is open and showing them. Each keeps its last glyph.
+            var skipping = Set(self.store.items)
+            if !self.isOpen { skipping.formUnion(self.store.hidden) }
+            if let own = self.ownBundleID { skipping.insert(own) }
+            MenuBarGlyphs.captureShownItems(skipping: skipping)
+        }
+        glyphWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    /// Shows the hidden items left of the dot and opens the drawer under it.
+    private func openBarback() {
+        endOpened(rehide: true)
+        notice.dismiss()
+        guard let dot else { return }
+        isOpen = true
+        hideTimer?.invalidate()
+        hideTimer = nil
+        if !store.hidden.isEmpty {
+            MenuBarSwitches.set(true, for: Set(store.hidden))
+        }
+        // With nothing in the drawer but items hidden, those are all there is to show. With
+        // nothing at all, the drawer says how to put something in.
+        if !drawerItems.isEmpty || store.hidden.isEmpty {
+            drawer.show(items: drawerItems, under: dot.frame, on: dot.screen)
+        }
+        applyDotStyle(.open)
+        startIdleTimer()
+        // The hidden items are back: their glyphs can be seen.
+        if !store.hidden.isEmpty { captureGlyphs(after: 0.6) }
+
+        let click: (NSEvent) -> Void = { [weak self] _ in
+            let location = NSEvent.mouseLocation
+            MainActor.assumeIsolated { self?.openClick(at: location) }
+        }
+        let key: (NSEvent) -> Void = { [weak self] event in
+            let isEscape = event.keyCode == 53
+            MainActor.assumeIsolated { if isEscape { self?.closeBarback() } }
+        }
+        openMonitors = [
+            NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown], handler: click),
+            NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { click($0); return $0 },
+            NSEvent.addGlobalMonitorForEvents(matching: .keyDown, handler: key),
+            NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                let isEscape = event.keyCode == 53
+                key(event)
+                return isEscape ? nil : event
+            },
+        ].compactMap { $0 }
+    }
+
+    /// A click while Barback is open. Clicks in the menu bar, and in what its items open,
+    /// keep the hidden items out so they can be used; anywhere else Barback closes.
+    private func openClick(at location: CGPoint) {
+        guard isOpen else { return }
+        // The dot toggles Barback itself; clicks in the drawer belong to it.
+        if drawer.isVisible && drawer.frame.contains(location) || dot?.frame.contains(location) == true { return }
+        if Screens.menuBars.contains(where: { $0.contains(location) }) {
+            // An item there opens its menu where the drawer may be.
+            closeDrawer()
+            return
+        }
+        let pids = Set(store.hidden.compactMap { NSRunningApplication.runningApplications(withBundleIdentifier: $0).first?.processIdentifier })
+        let inHiddenAppWindow = Screens.windows().contains { pids.contains($0.pid) && $0.level > 0 && $0.frame.contains(location) }
+        guard !inHiddenAppWindow,
+              MenuBarGeometry.isOutside(location, menuBars: Screens.menuBars, menus: Screens.openMenus) else { return }
+        closeBarback()
+    }
+
+    /// Closes the drawer and hides the hidden items again, once whatever they opened has
+    /// closed (hiding an item pulls it out from under its menu), or at once with `immediately`.
+    private func closeBarback(animated: Bool = true, immediately: Bool = false) {
+        openMonitors.forEach(NSEvent.removeMonitor)
+        openMonitors.removeAll()
+        stopIdleTimer()
+        closeDrawer(animated: animated)
+        let wasOpen = isOpen
+        isOpen = false
+        if dotStyle == .open { applyDotStyle(.dot) }
+        guard wasOpen else { return }
+        hideTimer?.invalidate()
+        hideTimer = nil
+        let hidden = Set(store.hidden)
+        guard !hidden.isEmpty else { return }
+        if immediately || !isHiddenItemShowingUI() {
+            switchOff(hidden)
+            return
+        }
+        hideTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.hideWhenUnused() }
+        }
+    }
+
+    private func hideWhenUnused() {
+        guard !isOpen, !isHiddenItemShowingUI() else { return }
+        hideTimer?.invalidate()
+        hideTimer = nil
+        switchOff(Set(store.hidden))
+    }
+
+    /// Whether a menu hangs from the menu bar, or an app hidden left of the dot shows a
+    /// window above normal ones (a popover or panel).
+    private func isHiddenItemShowingUI() -> Bool {
+        if !MenuBarGeometry.menuBarMenus(Screens.openMenus, menuBars: Screens.menuBars).isEmpty { return true }
+        let pids = Set(store.hidden.compactMap { NSRunningApplication.runningApplications(withBundleIdentifier: $0).first?.processIdentifier })
+        return Screens.windows().contains { pids.contains($0.pid) && $0.level > 0 }
+    }
+
+    // MARK: - Closing when left unused
+
+    private func startIdleTimer() {
+        stopIdleTimer()
+        guard settings.autoCloseSeconds > 0 else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        idleClock = IdleClock(delay: TimeInterval(settings.autoCloseSeconds), now: now)
+        lastIdleCheck = now
+        idleTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.checkIdle() }
+        }
+    }
+
+    private func stopIdleTimer() {
+        idleTimer?.invalidate()
+        idleTimer = nil
+        idleClock = nil
+    }
+
+    private func checkIdle() {
+        guard isOpen, var clock = idleClock else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        // The timer does not fire while one of Barback's own menus is open (a drawer item's
+        // menu, the dot's), nor while the Mac sleeps. A late check means one of those just
+        // ended, which counts as use.
+        let wasHeldUp = now - lastIdleCheck > 1.5
+        lastIdleCheck = now
+        let shouldClose = clock.shouldClose(now: now, isInUse: wasHeldUp || isInUse)
+        idleClock = clock
+        if shouldClose {
+            log("closing: unused for \(settings.autoCloseSeconds) s")
+            closeBarback()
+        }
+    }
+
+    /// Whether the user is doing something with an open Barback: dragging an item, using one
+    /// brought back from the drawer, pointing at the menu bar or the drawer, or looking at a
+    /// menu or popover of a hidden item.
+    private var isInUse: Bool {
+        if drag != nil || barLayout != nil || opened != nil { return true }
+        let pointer = NSEvent.mouseLocation
+        if Screens.menuBars.contains(where: { $0.contains(pointer) }) { return true }
+        // A little past the drawer's edge still counts, as does the gap between it and the menu bar.
+        if drawer.isVisible && drawer.frame.insetBy(dx: -12, dy: -12).contains(pointer) { return true }
+        return isHiddenItemShowingUI()
+    }
+
+    /// Closes only the drawer; Barback stays open.
+    private func closeDrawer(animated: Bool = true) {
+        drawer.dismiss(animated: animated)
+    }
+
+    private func refreshDrawer() {
+        applyDotStyle(dotStyle)
+        guard drawer.isVisible, let dot else { return }
+        if drawerItems.isEmpty && !store.hidden.isEmpty {
+            closeDrawer()
+            return
+        }
+        drawer.update(items: drawerItems, under: dot.frame, on: dot.screen)
+    }
+
+    // MARK: - Opening an item from the drawer
+
+    /// Opens a drawer item without bringing it back to the menu bar. Its app keeps the status
+    /// item while it is switched off: a menu is read and shown under the drawer icon, and
+    /// what is chosen there is pressed in the real one; anything else (a popover, a window)
+    /// is opened by pressing the item where it was last drawn.
+    private func open(_ bundleID: String) {
+        endOpened(rehide: true)
+        if bundleID == Self.spotlight {
+            // Spotlight's item is gone while switched off, but its shortcut still works.
+            closeBarback()
+            openSpotlight()
+            return
+        }
+        Task { [weak self] in
+            let extra = await Task.detached { MenuBarItems.appExtra(of: bundleID) }.value
+            guard let self else { return }
+            guard let extra else {
+                log("\(bundleID) has no item while hidden; opening it in the menu bar")
+                self.closeBarback()
+                self.openInMenuBar(bundleID)
+                return
+            }
+            let entries = await Task.detached { MenuBarItems.menu(of: extra) }.value
+            if let entries, !entries.isEmpty {
+                guard self.drawer.isVisible else { return }
+                self.drawer.popUp(self.makeMenu(entries), under: bundleID)
+            } else {
+                self.closeBarback()
+                await Task.detached { MenuBarItems.press(extra) }.value
+            }
+        }
+    }
+
+    /// A copy of an item's menu. Choosing an entry presses the real one.
+    private func makeMenu(_ entries: [MenuBarItems.MenuEntry]) -> NSMenu {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        for entry in entries {
+            if entry.isSeparator {
+                menu.addItem(.separator())
+                continue
+            }
+            let item = ClosureMenuItem(title: entry.title) { [weak self] in
+                self?.closeBarback()
+                Task.detached { MenuBarItems.press(entry.element) }
+            }
+            item.isEnabled = entry.isEnabled
+            item.state = entry.mark == nil ? .off : entry.mark == "-" ? .mixed : .on
+            if let key = entry.keyEquivalent {
+                // Shown only; the menu is not there when the key is pressed.
+                item.keyEquivalent = key.lowercased()
+                var mask: NSEvent.ModifierFlags = entry.modifiers & 8 == 0 ? [.command] : []
+                // Accessibility gives letters in capitals either way; Shift is its own flag.
+                if entry.modifiers & 1 != 0 { mask.insert(.shift) }
+                if entry.modifiers & 2 != 0 { mask.insert(.option) }
+                if entry.modifiers & 4 != 0 { mask.insert(.control) }
+                item.keyEquivalentModifierMask = mask
+            }
+            if let submenu = entry.submenu {
+                item.submenu = makeMenu(submenu)
+            }
+            menu.addItem(item)
+        }
+        return menu
+    }
+
+    /// Opens Spotlight with its keyboard shortcut (System Settings › Keyboard › Keyboard
+    /// Shortcuts › Spotlight), ⌘-Space unless it was changed.
+    private func openSpotlight() {
+        var keyCode: CGKeyCode = 49
+        var flags = CGEventFlags.maskCommand
+        let hotKeys = UserDefaults(suiteName: "com.apple.symbolichotkeys")?.dictionary(forKey: "AppleSymbolicHotKeys")
+        if let entry = hotKeys?["64"] as? [String: Any] {
+            guard (entry["enabled"] as? Bool) ?? true else {
+                showNotice("Couldn’t open Spotlight", detail: "Its keyboard shortcut is switched off in System Settings › Keyboard › Keyboard Shortcuts › Spotlight.")
+                return
+            }
+            if let parameters = (entry["value"] as? [String: Any])?["parameters"] as? [Int], parameters.count == 3 {
+                keyCode = CGKeyCode(parameters[1])
+                flags = CGEventFlags(rawValue: UInt64(parameters[2]))
+            }
+        }
+        let source = CGEventSource(stateID: .hidSystemState)
+        for isDown in [true, false] {
+            let event = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: isDown)
+            event?.flags = flags
+            event?.post(tap: .cghidEventTap)
+        }
+    }
+
+    /// Brings the item back to the menu bar just long enough to open it, for an app that
+    /// exposes no item while it is switched off.
+    private func openInMenuBar(_ bundleID: String) {
+        let name = AppInfo(bundleID: bundleID).name
+        placeRightOfDot(bundleID)
+        guard MenuBarSwitches.set(true, for: [bundleID]) == .done else {
+            showNotice("Couldn’t open \(name)", detail: "Its menu bar item could not be switched back on.")
+            return
+        }
+        // What MenuBarAgent's own items open (Wi-Fi's panel, …) is Control Center's.
+        let owner = SystemItems.item(id: bundleID) == nil ? bundleID : "com.apple.controlcenter"
+        let pid = NSRunningApplication.runningApplications(withBundleIdentifier: owner).first?.processIdentifier
+        opened = OpenedItem(bundleID: bundleID, pid: pid)
+        Task { [weak self] in
+            // MenuBarAgent draws the item again within a few frames.
+            var element: MenuBarItems.Element?
+            for _ in 0..<50 {
+                element = await Task.detached { MenuBarItems.menuExtra(of: bundleID) }.value
+                if element != nil { break }
+                try? await Task.sleep(for: .milliseconds(30))
+            }
+            guard let self, self.opened?.bundleID == bundleID else { return }
+            // Weather's app only runs while its item is switched on.
+            if self.opened?.pid == nil {
+                self.opened?.pid = NSRunningApplication.runningApplications(withBundleIdentifier: owner).first?.processIdentifier
+            }
+            guard let element else {
+                self.endOpened(rehide: true)
+                self.showNotice("Couldn’t open \(name)", detail: "Its item didn’t come back to the menu bar. There may not be room for it.")
+                return
+            }
+            await Task.detached { MenuBarItems.press(element) }.value
+            // Most items open on a press; a few take only a real click.
+            try? await Task.sleep(for: .milliseconds(350))
+            guard self.opened?.bundleID == bundleID else { return }
+            if !self.isOpenedItemShowingUI() {
+                log("\(bundleID) ignored the press; clicking it")
+                await self.click(bundleID)
+            }
+            self.watchOpened()
+        }
+    }
+
+    /// Gives an item that is about to come back a position just right of the dot, so the dot
+    /// stays the leftmost of what is shown, and what the item opens hangs near the drawer. An
+    /// app item MenuBarAgent keeps no position for yet can't be placed: its key is not known.
+    private func placeRightOfDot(_ bundleID: String) {
+        let positions = MenuBarPositions.all()
+        // An app signed ad hoc or run outside a bundle is named by its process name.
+        let names = [bundleID] + [NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first?.executableURL?.lastPathComponent].compactMap { $0 }
+        let keys = SystemItems.item(id: bundleID).map { [$0.positionKey] } ?? Array(Set(names.flatMap { PreferredPositions.keys(of: $0, in: positions) })).sorted()
+        guard let dot = positions[dotPositionKey], !keys.isEmpty else { return }
+        let next = positions.filter { !keys.contains($0.key) && $0.value < dot }.values.max()
+        guard let position = PreferredPositions.between(dot, and: next) else { return }
+        // Several items keep their order, a hair apart, all left of the next one.
+        let step = min(0.01, (next.map { position - $0 } ?? 1) / Double(keys.count + 1))
+        MenuBarPositions.set(Dictionary(uniqueKeysWithValues: keys.enumerated().map { ($1, position - Double($0) * step) }))
+    }
+
+    /// Clicks the item where it is drawn and puts the pointer back where it was.
+    private func click(_ bundleID: String) async {
+        guard let frame = await Task.detached(operation: { MenuBarItems.frame(of: bundleID) }).value else { return }
+        let target = CGPoint(x: frame.midX, y: frame.midY)
+        let saved = CGEvent(source: nil)?.location
+        let source = CGEventSource(stateID: .hidSystemState)
+        for type in [CGEventType.leftMouseDown, .leftMouseUp] {
+            let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: target, mouseButton: .left)
+            event?.setIntegerValueField(.mouseEventClickState, value: 1)
+            event?.post(tap: .cghidEventTap)
+            try? await Task.sleep(for: .milliseconds(40))
+        }
+        if let saved { CGWarpMouseCursorPosition(saved) }
+    }
+
+    /// Whether the opened item shows something: a menu hanging from the menu bar, or a
+    /// window of its app above normal windows (a popover or panel).
+    private func isOpenedItemShowingUI() -> Bool {
+        if !MenuBarGeometry.menuBarMenus(Screens.openMenus, menuBars: Screens.menuBars).isEmpty { return true }
+        guard let pid = opened?.pid else { return false }
+        return Screens.windows().contains { $0.pid == pid && $0.level > 0 }
+    }
+
+    /// Puts the opened item back once what it opened has closed, or after a click outside
+    /// the menu bar, its menu and its app's windows.
+    private func watchOpened() {
+        let pid = opened?.pid
+        openedTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.checkOpened() }
+        }
+        let click: (NSEvent) -> Void = { [weak self] _ in
+            let location = NSEvent.mouseLocation
+            MainActor.assumeIsolated {
+                guard let self, var current = self.opened else { return }
+                let inAppWindow = Screens.windows().contains { $0.pid == pid && $0.frame.contains(location) }
+                guard !inAppWindow,
+                      MenuBarGeometry.isOutside(location, menuBars: Screens.menuBars, menus: Screens.openMenus) else { return }
+                current.isDismissRequested = true
+                self.opened = current
+                self.checkOpened()
+            }
+        }
+        openedMonitors = [
+            NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown], handler: click),
+            NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { click($0); return $0 },
+        ].compactMap { $0 }
+    }
+
+    private func checkOpened() {
+        guard var current = opened else { return }
+        if isOpenedItemShowingUI() {
+            current.sawUI = true
+            opened = current
+        } else if current.sawUI || current.isDismissRequested {
+            // Hiding while its menu is open would pull the item out from under the menu.
+            endOpened(rehide: true)
+        }
+    }
+
+    private func endOpened(rehide: Bool) {
+        openedTimer?.invalidate()
+        openedTimer = nil
+        openedMonitors.forEach(NSEvent.removeMonitor)
+        openedMonitors.removeAll()
+        guard let current = opened else { return }
+        opened = nil
+        if rehide, store.contains(current.bundleID), !(isOpen && store.section(of: current.bundleID) == .hidden) {
+            switchOff([current.bundleID])
+        }
+    }
+
+    // MARK: - Notices
+
+    private func showNotice(_ title: String, detail: String, action: (String, () -> Void)? = nil) {
+        guard let dot else { return }
+        notice.show(title: title, detail: detail, action: action, under: dot.frame, on: dot.screen)
+    }
+
+    // MARK: - Workspace
+
+    /// Closes Barback and any notice, puts an opened item back and forgets a drag.
+    private func putEverythingAway(reason: String) {
+        log("putting everything away: \(reason)")
+        drag = nil
+        barLayout = nil
+        dropPanel.dismiss()
+        marker.dismiss()
+        lidWork?.cancel()
+        notice.dismiss(animated: false)
+        closeBarback(animated: false, immediately: true)
+        endOpened(rehide: true)
+        applyDotStyle(.dot)
+    }
+
+    /// MenuBarAgent draws the menu bar again a moment after the screens wake or unlock.
+    private func scheduleDotCheckAfterWake() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.scheduleDotCheck() }
+    }
+
+    private func observeWorkspace() {
+        let center = NSWorkspace.shared.notificationCenter
+        workspaceObservers = [
+            center.addObserver(forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.closeBarback() }
+            },
+            // Nothing should wait across sleep or a locked screen: a drawer left hanging, or
+            // hidden items left in the menu bar.
+            center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.putEverythingAway(reason: "sleep") }
+            },
+            center.addObserver(forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.putEverythingAway(reason: "screens sleep") }
+            },
+            center.addObserver(forName: NSWorkspace.sessionDidResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.putEverythingAway(reason: "session resigned") }
+            },
+            // The switches persist, but check them on wake in case something switched an item
+            // back on meanwhile (System Settings, a MenuBarAgent restart).
+            center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.hideStoredItems() }
+            },
+            center.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.hideStoredItems()
+                    self?.scheduleDotCheckAfterWake()
+                }
+            },
+            // The menu bar could not be read meanwhile: an item that showed up then is still
+            // left of the dot.
+            center.addObserver(forName: NSWorkspace.sessionDidBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.scheduleDotCheckAfterWake() }
+            },
+            DistributedNotificationCenter.default().addObserver(forName: .init("com.apple.screenIsUnlocked"), object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.scheduleDotCheckAfterWake() }
+            },
+            // Apps come and go from the drawer as they launch and quit.
+            center.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.refreshDrawer() }
+            },
+            center.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.refreshDrawer() }
+            },
+        ]
+    }
+}

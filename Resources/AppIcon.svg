@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Barback's app icon: a back bar, where things are kept until they are wanted.
+     scripts/make-icon.swift turns this into AppIcon.icns. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="night" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#34425f"/>
+      <stop offset="1" stop-color="#121826"/>
+    </linearGradient>
+    <linearGradient id="amber" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffd880"/>
+      <stop offset="1" stop-color="#f29a2e"/>
+    </linearGradient>
+    <linearGradient id="copper" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffb35c"/>
+      <stop offset="1" stop-color="#e2672a"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#night)"/>
+  <!-- A tall bottle -->
+  <path fill="url(#amber)" d="M298,704 L298,492 C298,438 334,432 334,388 L334,318 L378,318 L378,388 C378,432 414,438 414,492 L414,704 Z"/>
+  <rect fill="url(#amber)" x="326" y="282" width="60" height="30" rx="9"/>
+  <!-- A decanter with a stopper -->
+  <path fill="url(#copper)" d="M446,704 L446,584 C446,530 488,536 488,494 L488,452 L536,452 L536,494 C536,536 578,530 578,584 L578,704 Z"/>
+  <circle fill="url(#copper)" cx="512" cy="420" r="32"/>
+  <!-- A glass, half full -->
+  <path fill="#ffffff" fill-opacity="0.28" d="M610,572 L726,572 L714,704 L622,704 Z"/>
+  <path fill="url(#amber)" d="M616,636 L720,636 L714,704 L622,704 Z"/>
+  <!-- The shelf -->
+  <rect fill="#f4f1ea" x="232" y="700" width="560" height="40" rx="20"/>
+</svg>

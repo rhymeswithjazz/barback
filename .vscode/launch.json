@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:barback}",
+            "name": "Debug Barback",
+            "target": "Barback",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug Barback"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:barback}",
+            "name": "Release Barback",
+            "target": "Barback",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release Barback"
+        }
+    ]
+}
